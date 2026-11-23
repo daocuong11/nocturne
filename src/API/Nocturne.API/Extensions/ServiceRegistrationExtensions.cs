@@ -1207,6 +1207,7 @@ public static class ServiceRegistrationExtensions
         services.AddSingleton<ISecretEncryptionService, SecretEncryptionService>();
         services.AddScoped<IConnectorConfigurationService, ConnectorConfigurationService>();
         services.AddScoped<IConnectorSyncCursorStore, ConnectorSyncCursorStore>();
+        services.AddScoped<IConnectorStateStore, ConnectorStateStore>();
         services.AddScoped<PlatformSettingsService>();
         services.AddScoped<IConnectorSyncService, ConnectorSyncService>();
         services.AddScoped<IConnectorCursorResetService, ConnectorCursorResetService>();

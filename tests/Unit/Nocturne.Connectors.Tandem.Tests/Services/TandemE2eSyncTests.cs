@@ -12,6 +12,7 @@ using Nocturne.Connectors.Core.Services;
 using Nocturne.Connectors.Tandem.Configurations;
 using Nocturne.Connectors.Tandem.Services;
 using Nocturne.Tests.Shared.Connectors;
+using Nocturne.Core.Contracts.Connectors;
 using Nocturne.Core.Contracts.V4;
 using Nocturne.Core.Models;
 using Nocturne.Core.Models.V4;
@@ -369,6 +370,31 @@ public class TandemE2eSyncTests
     }
 
     /// <summary>
+    /// A reset keeps the published-profile fingerprints, so the run after it offers every record of
+    /// the window again, stores none of them twice and does not publish the unchanged profile again.
+    /// </summary>
+    [Fact]
+    public async Task A_reset_run_offers_the_window_again_and_keeps_the_published_profile()
+    {
+        var store = new StoringConnectorPublisher();
+        var fixture = new Fixture(PumperWithSettings(basalRate: 1000), publisher: store);
+        var from = Utc(2026, 5, 14, 0, 0, 0);
+        var to = Utc(2026, 5, 18, 23, 59, 59);
+
+        (await fixture.RunAsync(new SyncRequest { From = from, To = to })).Success.Should().BeTrue();
+        var stored = store.Stored.Keys.ToList();
+        var offered = store.Offered;
+        var fingerprints = ((InMemoryConnectorStateStore)store.State).Vendor.Keys.ToList();
+        (await fixture.RunAsync(SyncRequest.Reset(from, to, null))).Success.Should().BeTrue();
+
+        fingerprints.Should().ContainSingle().Which.Should().StartWith("profile:");
+        ((InMemoryConnectorStateStore)store.State).Vendor.Keys.Should().Equal(fingerprints);
+        store.Offered.Should().BeEquivalentTo(offered.ToDictionary(
+            o => o.Key, o => o.Key == nameof(Profile) ? o.Value : o.Value * 2));
+        store.Stored.Keys.Should().BeEquivalentTo(stored);
+    }
+
+    /// <summary>
     /// A pump that reports no newest-event time is read up to the clock, so the fetch ends on the
     /// clock's day rather than on the day the pump last wrote.
     /// </summary>
@@ -641,6 +667,24 @@ public class TandemE2eSyncTests
     }
 
     /// <summary>
+    /// A purge that allows re-import clears the vendor state with the fingerprints in it, so the next
+    /// sync publishes the unchanged settings again in place of the purged profile.
+    /// </summary>
+    [Fact]
+    public async Task Unchanged_pump_settings_are_published_again_after_a_purge_allowing_reimport()
+    {
+        var fixture = new Fixture(PumperWithSettings(basalRate: 1000));
+
+        await fixture.RunAsync(ProfilesOnly);
+        await fixture.Publisher.State.ClearAsync(
+            "tconnectsync-connector", ConnectorStateSlots.Resume | ConnectorStateSlots.Vendor);
+        var result = await fixture.RunAsync(ProfilesOnly);
+
+        fixture.Publisher.Profiles.Should().HaveCount(2);
+        result.ItemsSynced[SyncDataType.Profiles].Should().Be(1);
+    }
+
+    /// <summary>
     /// A scheduled run's window starts at the glucose watermark, so one that cannot be read stops the
     /// run before it asks the pump for anything. A requested run reads it only where it sets its own
     /// window, after the pump's settings are published.
@@ -713,11 +757,11 @@ public class TandemE2eSyncTests
     }
 
     [Fact]
-    public async Task A_cursor_store_that_times_out_still_lets_the_profile_publish()
+    public async Task A_state_store_that_times_out_still_lets_the_profile_publish()
     {
         var fixture = new Fixture(
             PumperWithSettings(basalRate: 1000),
-            cursorStoreOnGet: _ => throw new TaskCanceledException("The store timed out."));
+            stateOnRead: _ => throw new TaskCanceledException("The store timed out."));
 
         var result = await fixture.RunAsync(ProfilesOnly);
 
@@ -726,13 +770,13 @@ public class TandemE2eSyncTests
     }
 
     [Fact]
-    public async Task A_cursor_store_read_cancelled_by_the_run_propagates()
+    public async Task A_state_store_read_cancelled_by_the_run_propagates()
     {
         using var cancellation = new CancellationTokenSource();
         var fixture = new Fixture(
             PumperWithSettings(basalRate: 1000),
             cancellation: cancellation,
-            cursorStoreOnGet: token =>
+            stateOnRead: token =>
             {
                 cancellation.Cancel();
                 token.ThrowIfCancellationRequested();
@@ -869,32 +913,6 @@ public class TandemE2eSyncTests
                 new Dictionary<string, string> { [PumperIdKey] = "pumper-1", [AccountIdKey] = "account-1" }));
     }
 
-    private sealed class InMemoryCursorStore(Action<CancellationToken>? onGet = null) : IConnectorSyncCursorStore
-    {
-        private readonly Dictionary<(string, string), ConnectorSyncCursor> _cursors = [];
-
-        public Task<ConnectorSyncCursor?> GetAsync(string connectorName, string resource, CancellationToken cancellationToken = default)
-        {
-            onGet?.Invoke(cancellationToken);
-            return Task.FromResult(_cursors.GetValueOrDefault((connectorName, resource)));
-        }
-
-        public Task SetAsync(string connectorName, string resource, ConnectorSyncCursor cursor, CancellationToken cancellationToken = default)
-        {
-            _cursors[(connectorName, resource)] = cursor;
-            return Task.CompletedTask;
-        }
-
-        public Task<JsonNode?> GetJsonAsync(string connectorName, string resource, CancellationToken cancellationToken = default) =>
-            throw new NotSupportedException();
-
-        public Task SetJsonAsync(string connectorName, string resource, JsonNode value, CancellationToken cancellationToken = default) =>
-            throw new NotSupportedException();
-
-        public Task RemoveAsync(string connectorName, string resource, CancellationToken cancellationToken = default) =>
-            throw new NotSupportedException();
-    }
-
     /// <summary>Records every published record; the Nocturne analog of upstream's FakeNightscout.</summary>
     private sealed class RecordingPublisher(DateTime? latestEntry, DateTime? latestTreatment)
         : IConnectorPublisher, IGlucosePublisher, ITreatmentPublisher, IDevicePublisher, IMetadataPublisher
@@ -927,6 +945,7 @@ public class TandemE2eSyncTests
             SystemEvents.Count + Profiles.Count > 0;
 
         public bool IsAvailable => true;
+        public IConnectorStateStore State { get; init; } = new InMemoryConnectorStateStore();
         public IGlucosePublisher Glucose => this;
         public ITreatmentPublisher Treatments => this;
         public IDevicePublisher Device => this;
@@ -1027,10 +1046,6 @@ public class TandemE2eSyncTests
             Task.FromResult<DateTime?>(null);
         public Task<DateTime?> GetLatestStateSpanTimestampAsync(string source, CancellationToken ct = default) =>
             Task.FromResult<DateTime?>(null);
-        public Task<IReadOnlyDictionary<string, DateTime>> GetBackfillLowWaterMarksAsync(string source, CancellationToken ct = default) =>
-            Task.FromResult<IReadOnlyDictionary<string, DateTime>>(new Dictionary<string, DateTime>());
-        public Task SetBackfillLowWaterMarksAsync(string source, IReadOnlyDictionary<string, DateTime?> changes, CancellationToken ct = default) =>
-            Task.CompletedTask;
     }
 
     private sealed class Fixture
@@ -1051,7 +1066,7 @@ public class TandemE2eSyncTests
             TimeProvider? clock = null,
             string? timesOutOn = null,
             CancellationTokenSource? cancellation = null,
-            Action<CancellationToken>? cursorStoreOnGet = null,
+            Action<CancellationToken>? stateOnRead = null,
             bool watermarksFollowPublishes = false,
             bool glucoseWatermarkFails = false,
             IConnectorPublisher? publisher = null)
@@ -1075,6 +1090,7 @@ public class TandemE2eSyncTests
             {
                 FollowsPublishes = watermarksFollowPublishes,
                 GlucoseWatermarkFails = glucoseWatermarkFails,
+                State = new InMemoryConnectorStateStore { BeforeRead = stateOnRead },
             };
             _responses = new Dictionary<string, string>
             {
@@ -1090,7 +1106,6 @@ public class TandemE2eSyncTests
                 Mock.Of<IRetryDelayStrategy>(),
                 new FakeTandemAuthTokenProvider(),
                 publisher ?? Publisher,
-                new InMemoryCursorStore(cursorStoreOnGet),
                 clock);
         }
 
