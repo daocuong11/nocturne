@@ -971,6 +971,7 @@ public class SetupControllerTests : IDisposable
             Times.Once,
             "the session is issued before last-login, and its refresh token is never delivered");
         _controller.HttpContext.Response.Headers.SetCookie.Should().BeEmpty();
+        _recoveryCodeService.Verify(s => s.GenerateCodesAsync(It.IsAny<Guid>()), Times.Never);
         VerifyNoLoginRow();
     }
 
@@ -1325,7 +1326,7 @@ public class SetupControllerTests : IDisposable
     private const string SetupOidcRow = """{"method":"oidc","enrolment":"setup"}""";
 
     [Fact]
-    public async Task OwnerComplete_EndsSetupAndMakesRecoveryCodesBeforeTheSessionThenLastLoginThenTheLoginRow()
+    public async Task OwnerComplete_EndsSetupThenSignsInThenMakesRecoveryCodes()
     {
         var (tenantId, subjectId) = await SeedSoleTenantWithOwnerRoleAsync();
         var steps = RecordSteps(tenantId);
@@ -1343,8 +1344,8 @@ public class SetupControllerTests : IDisposable
             ExpiresIn = 3600,
         });
         steps.Should().Equal(
-            "proof", "recovery-codes (setup ended)", "session (setup ended)", "last-login",
-            $"audit:{AuthAuditEventType.Login}:True:{SetupPasskeyRow}");
+            "proof", "session (setup ended)", "last-login",
+            $"audit:{AuthAuditEventType.Login}:True:{SetupPasskeyRow}", "recovery-codes (setup ended)");
         var expectedContext = new SessionContext(DeviceDescription: "Setup Passkey", IpAddress: ClientIp, UserAgent: Agent);
         _sessionService.Verify(s => s.IssueSessionAsync(subjectId, expectedContext, It.IsAny<CancellationToken>()));
         _auditService.Verify(a => a.LogAsync(
@@ -1474,6 +1475,7 @@ public class SetupControllerTests : IDisposable
         _auditService.Verify(a => a.LogAsync(
             AuthAuditEventType.Login, subjectId, false, It.IsAny<string?>(), It.IsAny<string?>(), null,
             """{"method":"passkey","enrolment":"setup","secondFactorPending":true}""", null, null, null));
+        _recoveryCodeService.Verify(s => s.GenerateCodesAsync(It.IsAny<Guid>()), Times.Never);
 
         await AssertOwnerCanSignInAsync(tenantId, subjectId);
     }
@@ -1495,11 +1497,16 @@ public class SetupControllerTests : IDisposable
         _auditService.Verify(a => a.LogAsync(
             AuthAuditEventType.FailedAuth, subjectId, false, It.IsAny<string?>(), It.IsAny<string?>(), null,
             """{"method":"passkey","enrolment":"setup","reason":"not_a_member"}""", null, null, null));
+        _recoveryCodeService.Verify(s => s.GenerateCodesAsync(It.IsAny<Guid>()), Times.Never);
         VerifyNoLoginRow();
     }
 
+    /// <summary>
+    /// The session cookies are already on the response when the codes fail; the exception handler
+    /// clears the response before it writes the 500, so none is delivered.
+    /// </summary>
     [Fact]
-    public async Task OwnerComplete_WhenTheRecoveryCodesCannotBeMade_LeavesAnOwnerWhoSignsInWithThePasskeyAndNoSession()
+    public async Task OwnerComplete_WhenTheRecoveryCodesCannotBeMade_LeavesAnUndeliveredSessionAndAnOwnerWhoSignsInWithThePasskey()
     {
         var (tenantId, subjectId) = await SeedSoleTenantWithOwnerRoleAsync();
         StubStoredPasskey(subjectId);
@@ -1510,16 +1517,13 @@ public class SetupControllerTests : IDisposable
 
         await act.Should().ThrowAsync<DbUpdateException>();
         _sessionService.Verify(
-            s => s.IssueSessionAsync(It.IsAny<Guid>(), It.IsAny<SessionContext>(), It.IsAny<CancellationToken>()),
-            Times.Never);
-        _subjectService.Verify(s => s.UpdateLastLoginAsync(It.IsAny<Guid>()), Times.Never);
-        _controller.HttpContext.Response.Headers.SetCookie.Should().BeEmpty();
-        VerifyNoLoginRow();
+            s => s.IssueSessionAsync(subjectId, It.IsAny<SessionContext>(), It.IsAny<CancellationToken>()),
+            Times.Once);
         await AssertOwnerCanSignInAsync(tenantId, subjectId);
     }
 
     [Fact]
-    public async Task OwnerComplete_WhenTheSessionCannotBeIssued_LeavesUnshownRecoveryCodesAndAnOwnerWhoSignsInWithThePasskey()
+    public async Task OwnerComplete_WhenTheSessionCannotBeIssued_MakesNoRecoveryCodesAndLeavesAnOwnerWhoSignsInWithThePasskey()
     {
         var (tenantId, subjectId) = await SeedSoleTenantWithOwnerRoleAsync();
         StubStoredPasskey(subjectId);
@@ -1530,7 +1534,7 @@ public class SetupControllerTests : IDisposable
         var act = () => CompleteOwnerSetupAsync();
 
         await act.Should().ThrowAsync<DbUpdateException>();
-        _recoveryCodeService.Verify(s => s.GenerateCodesAsync(subjectId), Times.Once);
+        _recoveryCodeService.Verify(s => s.GenerateCodesAsync(It.IsAny<Guid>()), Times.Never);
         _subjectService.Verify(s => s.UpdateLastLoginAsync(It.IsAny<Guid>()), Times.Never);
         _controller.HttpContext.Response.Headers.SetCookie.Should().BeEmpty();
         VerifyNoLoginRow();

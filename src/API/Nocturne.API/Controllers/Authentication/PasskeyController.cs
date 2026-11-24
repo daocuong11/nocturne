@@ -498,7 +498,10 @@ public class PasskeyController : ControllerBase
     }
 
     /// <summary>
-    /// Complete passkey login with assertion response
+    /// Complete passkey login with assertion response. A member who has never held recovery codes
+    /// gets them in the response when the caller shows them
+    /// (<see cref="PasskeyLoginCompleteRequest.ShowsRecoveryCodes"/>,
+    /// <see cref="IRecoveryCodeService.GenerateFirstCodesAsync"/>).
     /// </summary>
     [HttpPost("login/complete")]
     [AllowAnonymous]
@@ -558,6 +561,9 @@ public class PasskeyController : ControllerBase
                 Success = true,
                 AccessToken = signedIn.Session.AccessToken,
                 ExpiresIn = signedIn.Session.ExpiresInSeconds,
+                RecoveryCodes = request.ShowsRecoveryCodes
+                    ? await _recoveryCodeService.GenerateFirstCodesAsync(assertionResult.SubjectId)
+                    : null,
             }),
             SignInOutcome.SecondFactorRequired required => Ok(new PasskeyLoginCompleteResponse
             {
@@ -1039,7 +1045,8 @@ public class PasskeyController : ControllerBase
 
     /// <summary>
     /// Complete passkey registration for an invite acceptance.
-    /// Verifies attestation, accepts the invite, generates recovery codes, and issues a session.
+    /// Verifies attestation, accepts the invite, issues a session, and then generates recovery codes
+    /// (<see cref="IRecoveryCodeService.GenerateFirstCodesAsync"/>).
     /// </summary>
     /// <remarks>
     /// The challenge must have been minted by <see cref="InviteOptions"/>
@@ -1092,9 +1099,6 @@ public class PasskeyController : ControllerBase
 
             await _subjectService.UpdateLastLoginAsync(credResult.SubjectId);
 
-            // Generate recovery codes
-            var recoveryCodes = await _recoveryCodeService.GenerateCodesAsync(credResult.SubjectId);
-
             var session = await _sessionService.IssueSessionAsync(
                 credResult.SubjectId,
                 new SessionContext(
@@ -1103,6 +1107,8 @@ public class PasskeyController : ControllerBase
                     UserAgent: Request.Headers.UserAgent.ToString()));
 
             Response.SetSessionCookies(session, _oidcOptions);
+
+            var recoveryCodes = await _recoveryCodeService.GenerateCodesAsync(credResult.SubjectId);
 
             _logger.LogInformation(
                 "Invite complete: subject {SubjectId} registered with passkey via invite",
@@ -1176,8 +1182,8 @@ public class PasskeyController : ControllerBase
 
     /// <summary>
     /// Complete passkey registration for a tenant creation invite: takes one use of the link,
-    /// verifies the attestation, creates the tenant with the new subject as its owner, and signs
-    /// them in.
+    /// verifies the attestation, creates the tenant with the new subject as its owner, signs them
+    /// in, and then generates recovery codes (<see cref="IRecoveryCodeService.GenerateFirstCodesAsync"/>).
     /// </summary>
     /// <remarks>
     /// The use is taken before the ceremony and given back if it fails, so two people on a
@@ -1273,8 +1279,6 @@ public class PasskeyController : ControllerBase
 
         await _subjectService.UpdateLastLoginAsync(credResult.SubjectId);
 
-        var recoveryCodes = await _recoveryCodeService.GenerateCodesAsync(credResult.SubjectId);
-
         var session = await _sessionService.IssueSessionAsync(
             credResult.SubjectId,
             new SessionContext(
@@ -1283,6 +1287,8 @@ public class PasskeyController : ControllerBase
                 UserAgent: Request.Headers.UserAgent.ToString()));
 
         Response.SetSessionCookies(session, _oidcOptions);
+
+        var recoveryCodes = await _recoveryCodeService.GenerateCodesAsync(credResult.SubjectId);
 
         // The account exists and is signed in either way, so a refused tenant is reported beside
         // the session rather than in place of it: the page shows the recovery codes, then lets the
@@ -1382,6 +1388,12 @@ public class PasskeyLoginCompleteRequest
 {
     public string AssertionResponseJson { get; set; } = string.Empty;
     public string ChallengeToken { get; set; } = string.Empty;
+
+    /// <summary>
+    /// Whether the caller shows the recovery codes of its <see cref="PasskeyLoginCompleteResponse"/> to the person.
+    /// Only such a caller is given first codes: codes it dropped would be stored and never seen.
+    /// </summary>
+    public bool ShowsRecoveryCodes { get; set; }
 }
 
 /// <summary>
@@ -1396,6 +1408,12 @@ public class PasskeyLoginCompleteResponse
     public int ExpiresIn { get; set; }
     public bool TotpRequired { get; set; }
     public string? StepUpToken { get; set; }
+
+    /// <summary>
+    /// The member's first recovery codes, when this sign-in issued them
+    /// (<see cref="IRecoveryCodeService.GenerateFirstCodesAsync"/>). They are shown nowhere else.
+    /// </summary>
+    public List<string>? RecoveryCodes { get; set; }
 }
 
 /// <summary>
